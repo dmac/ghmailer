@@ -1,0 +1,15 @@
+addr = ":8000"
+
+[users.alice]
+email = "alice@example.com"
+
+[[users.alice.filters]]
+authors = ["bob@example.com"]
+branches = ["master", "gh-pages"]
+repos = ["public-repo"]
+
+[users.bob]
+email = "bob@example.com"
+
+[[users.bob.filters]]
+repos = ["public-repo"]
