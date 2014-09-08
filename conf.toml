@@ -1,5 +1,9 @@
 addr = ":8000"
 
+email_smtp_addr = "smtp.gmail.com:587"
+email_from = "user@gmail.com"
+email_password = "password"
+
 [users.alice]
 email = "alice@example.com"
 

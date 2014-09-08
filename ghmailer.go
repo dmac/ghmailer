@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/smtp"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -27,7 +28,11 @@ type User struct {
 }
 
 type Conf struct {
-	Addr  string
+	Addr          string
+	EmailSMTPAddr string `toml:"email_smtp_addr"`
+	EmailFrom     string `toml:"email_from"`
+	EmailPassword string `toml:"email_password"`
+
 	Users map[string]User
 }
 
@@ -103,6 +108,29 @@ func (u User) FilterCommits(pe PushEvent) []Commit {
 	return commits
 }
 
+func (u User) SendCommitEmail(commit Commit) error {
+	server := strings.SplitN(conf.EmailSMTPAddr, ":", 2)[0]
+	auth := smtp.PlainAuth(
+		"",
+		conf.EmailFrom,
+		conf.EmailPassword,
+		server,
+	)
+
+	// TODO: Flesh out email content
+	subject := "New commit: " + commit.Id
+	body := commit.Id
+	err := smtp.SendMail(
+		conf.EmailSMTPAddr,
+		auth,
+		conf.EmailFrom,
+		[]string{u.Email},
+		[]byte("Subject: "+subject+"\r\n\r\n"+body),
+	)
+
+	return err
+}
+
 func logRequest(r *http.Request) {
 	log.Printf("%s %s", r.Method, r.URL.Path)
 }
@@ -139,11 +167,10 @@ func pushHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, user := range conf.Users {
-		commits := user.FilterCommits(pushEvent)
-		// TODO: Send commit emails
-		for _, commit := range commits {
-			log.Printf("Send email to %s for %s %s %s\n",
-				user.Email, pushEvent.Repository.Name, pushEvent.Ref, commit.Id)
+		for _, commit := range user.FilterCommits(pushEvent) {
+			if err := user.SendCommitEmail(commit); err != nil {
+				log.Printf("Error: %s\n", err)
+			}
 		}
 	}
 }
