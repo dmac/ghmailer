@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -13,18 +12,8 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-var confFlag = flag.String("conf", "conf.toml", "Path to TOML config")
-var conf Conf
-
-type Filter struct {
-	Authors  []string
-	Branches []string
-	Repos    []string
-}
-
-type User struct {
-	Email   string
-	Filters []Filter
+type Mailer struct {
+	conf Conf
 }
 
 type Conf struct {
@@ -32,8 +21,33 @@ type Conf struct {
 	EmailSMTPAddr string `toml:"email_smtp_addr"`
 	EmailFrom     string `toml:"email_from"`
 	EmailPassword string `toml:"email_password"`
+	Users         map[string]*User
+}
 
-	Users map[string]User
+type User struct {
+	Email   string
+	Filters []*Filter
+}
+
+type Filter struct {
+	Authors  []string
+	Branches []string
+	Repos    []string
+}
+
+type PushEvent struct {
+	Ref        string
+	Repository *Repository
+	Commits    []*Commit
+}
+
+type Repository struct {
+	Name string
+}
+
+type Commit struct {
+	Id     string
+	Author *Author
 }
 
 type Author struct {
@@ -42,24 +56,61 @@ type Author struct {
 	Username string
 }
 
-type Commit struct {
-	Id     string
-	Author Author
+func main() {
+	var confPath = flag.String("conf", "conf.toml", "Path to TOML config")
+	flag.Parse()
+	var m Mailer
+	if _, err := toml.DecodeFile(*confPath, &m.conf); err != nil {
+		log.Fatalln("Error parsing conf file:", err)
+	}
+	log.Printf("Listening on %s", m.conf.Addr)
+	log.Fatal(http.ListenAndServe(m.conf.Addr, &m))
 }
 
-type Repository struct {
-	Name string
+func (m *Mailer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/":
+		if r.Method != "GET" {
+			http.Error(w, "method not allowed (expected GET)", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Write([]byte("ghmailer ok\n"))
+		return
+	case "/push":
+		if r.Method != "POST" {
+			http.Error(w, "method not allowed (expected POST)", http.StatusMethodNotAllowed)
+			return
+		}
+		m.HandlePush(w, r)
+		return
+	}
+	http.Error(w, "not found", 404)
 }
 
-type PushEvent struct {
-	Ref        string
-	Repository Repository
-	Commits    []Commit
+func (m *Mailer) HandlePush(w http.ResponseWriter, r *http.Request) {
+	b, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		log.Println("Error reading post body:", err)
+		http.Error(w, "internal error", 500)
+		return
+	}
+	var pushEvent PushEvent
+	if err := json.Unmarshal(b, &pushEvent); err != nil {
+		log.Printf("Error unmarshaling post body: %s; %s", err, string(b))
+		http.Error(w, "internal error", 500)
+		return
+	}
+	for _, user := range m.conf.Users {
+		for _, commit := range user.FilterCommits(&pushEvent) {
+			if err := m.SendCommitEmail(user, commit); err != nil {
+				log.Printf("Error sending commit email: %s", err)
+			}
+		}
+	}
 }
 
-func (u User) FilterCommits(pe PushEvent) []Commit {
+func (u *User) FilterCommits(pe *PushEvent) []*Commit {
 	shas := make(map[string]struct{})
-
 	for _, filter := range u.Filters {
 		// Check repos
 		repoMatched := len(filter.Repos) == 0
@@ -74,6 +125,10 @@ func (u User) FilterCommits(pe PushEvent) []Commit {
 
 		// Check branches
 		split := strings.SplitN(pe.Ref, "/", 3)
+		if len(split) != 3 {
+			log.Println("Error parsing ref:", pe.Ref)
+			continue
+		}
 		pushedBranch := split[len(split)-1]
 		branchMatched := len(filter.Branches) == 0
 		for _, branch := range filter.Branches {
@@ -99,7 +154,7 @@ func (u User) FilterCommits(pe PushEvent) []Commit {
 	}
 
 	// Collect and return commits
-	var commits []Commit
+	var commits []*Commit
 	for _, commit := range pe.Commits {
 		if _, ok := shas[commit.Id]; ok {
 			commits = append(commits, commit)
@@ -108,87 +163,22 @@ func (u User) FilterCommits(pe PushEvent) []Commit {
 	return commits
 }
 
-func (u User) SendCommitEmail(commit Commit) error {
-	server := strings.SplitN(conf.EmailSMTPAddr, ":", 2)[0]
+func (m *Mailer) SendCommitEmail(u *User, commit *Commit) error {
+	host := strings.SplitN(m.conf.EmailSMTPAddr, ":", 2)[0]
 	auth := smtp.PlainAuth(
 		"",
-		conf.EmailFrom,
-		conf.EmailPassword,
-		server,
+		m.conf.EmailFrom,
+		m.conf.EmailPassword,
+		host,
 	)
-
 	// TODO: Flesh out email content
 	subject := "New commit: " + commit.Id
 	body := commit.Id
-	err := smtp.SendMail(
-		conf.EmailSMTPAddr,
+	return smtp.SendMail(
+		m.conf.EmailSMTPAddr,
 		auth,
-		conf.EmailFrom,
+		m.conf.EmailFrom,
 		[]string{u.Email},
 		[]byte("Subject: "+subject+"\r\n\r\n"+body),
 	)
-
-	return err
-}
-
-func logRequest(r *http.Request) {
-	log.Printf("%s %s", r.Method, r.URL.Path)
-}
-
-func rootHandler(w http.ResponseWriter, r *http.Request) {
-	logRequest(r)
-	if r.Method != "GET" || r.URL.Path != "/" {
-		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprintln(w, "Not Found")
-		return
-	}
-	fmt.Fprintf(w, "OK\n")
-}
-
-func pushHandler(w http.ResponseWriter, r *http.Request) {
-	logRequest(r)
-	if r.Method != "POST" {
-		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprintln(w, "Not Found")
-		return
-	}
-	jsonData, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		log.Println(err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	var pushEvent PushEvent
-	err = json.Unmarshal(jsonData, &pushEvent)
-	if err != nil {
-		log.Println(err)
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	for _, user := range conf.Users {
-		for _, commit := range user.FilterCommits(pushEvent) {
-			if err := user.SendCommitEmail(commit); err != nil {
-				log.Printf("Error: %s\n", err)
-			}
-		}
-	}
-}
-
-func parseConf() error {
-	_, err := toml.DecodeFile(*confFlag, &conf)
-	return err
-}
-
-func main() {
-	flag.Parse()
-	err := parseConf()
-	if err != nil {
-		panic(err)
-	}
-	http.HandleFunc("/", rootHandler)
-	http.HandleFunc("/push", pushHandler)
-
-	log.Printf("Listening on %s", conf.Addr)
-	log.Fatal(http.ListenAndServe(conf.Addr, nil))
 }
